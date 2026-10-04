@@ -5,6 +5,7 @@
 * ``GET  /ready``             就绪检查
 * ``GET  /``                  服务信息
 * ``POST /api/v1/recover``    提交接收比特串进行联合复原
+  （可选 line_code="nrzi" + initial_level：直接复原 NRZI 线电平）
 """
 
 from __future__ import annotations
@@ -91,6 +92,7 @@ class _Handler(BaseHTTPRequestHandler):
             result = reconstruct(
                 req.received, req.frame_count, req.sync,
                 req.payload_len, req.max_slippage,
+                line_code=req.line_code, initial_level=req.initial_level,
             )
         except Exception as exc:  # 防御：服务不因单个请求崩溃
             LOG.exception("reconstruction failed: %s", exc)

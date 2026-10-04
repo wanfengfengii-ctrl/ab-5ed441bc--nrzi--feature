@@ -29,6 +29,20 @@
 预算，高代价路径不可能进入全局最优解。滑移预算 <= 6，同一层接收游标满足
 ``|i-j| <= cost``，状态空间有界。
 
+NRZI 线电平（可选 ``line_code="nrzi"``）
+----------------------------------------
+部分接收机失锁排障时只导出连续线电平。NRZI 以逻辑 1 翻转电平、逻辑 0
+保持电平，编码状态**跨帧连续**（绝不逐帧重置）；``initial_level`` 为首个
+发送位之前的电平，可取 0/1 或 "unknown"。求解器在同一 DP 内联合裁决初始
+电平、物理校正串、逻辑帧与插入/漏失：帧内状态增加"上一发送电平"维度，
+匹配/漏失边按 ``逻辑比特 = 上一电平 XOR 当前电平`` 推进同步字约束与 CRC
+寄存器，校正串记录物理电平。最优解与唯一性仍按滑移次数与**物理校正串**
+字典序判定；初始电平由获胜物理校正串首比特与同步字首比特异或反推（首位
+逻辑比特必为同步字首比特，故同一物理串不可能对应两个初始电平）。
+``initial_level="unknown"`` 时两个候选电平作为两个初始状态同时进入同一
+DP，等价于联合枚举裁决。逐帧重置 NRZI 状态或先差分再复原都会让单个漏采
+电平污染后续判读，本实现不做此类近似。
+
 CRC-8：多项式 x^8+x^2+x+1（0x07），初值 0，最高位优先。
 """
 
@@ -130,10 +144,12 @@ class ReconstructionResult:
     alternatives: int  # 0 或 >=1（不同同代价校正串数量的截断标志）
     minimum_slippage_lower_bound: int | None
     budget: int
+    # NRZI 模式成功时推定的初始电平（0/1）；直读模式或失败时为 None
+    initial_level: int | None = None
 
     def to_dict(self) -> dict:
         if self.recoverable:
-            return {
+            out = {
                 "recoverable": True,
                 "corrected": self.corrected,
                 "frames": [f.to_dict() for f in self.frames],
@@ -143,6 +159,9 @@ class ReconstructionResult:
                 "alternatives": self.alternatives,
                 "budget": self.budget,
             }
+            if self.initial_level is not None:
+                out["initial_level"] = self.initial_level
+            return out
         return {
             "recoverable": False,
             "reason": "滑移预算内不存在通过同步字与 CRC 校验的完整帧流",
@@ -153,12 +172,20 @@ class ReconstructionResult:
 
 
 def reconstruct(received: str, frame_count: int, sync: str, payload_len: int,
-                max_slippage: int) -> ReconstructionResult:
+                max_slippage: int, line_code: str | None = None,
+                initial_level=None) -> ReconstructionResult:
     """在整条接收流上联合复原 ``frame_count`` 个等长帧。
 
     滑移预算从 0 逐档放宽：第一档存在完整帧流时，该档代价即为全局最小
     滑移次数（无滑移档只有唯一的匹配路径，求解极快）。
+
+    ``line_code="nrzi"`` 时接收流为 NRZI 线电平（逻辑 1 翻转、逻辑 0
+    保持，编码状态跨帧连续），``initial_level`` 取 0/1 固定首个发送位
+    之前的电平，取 "unknown" 时两个候选电平同时进入同一 DP 联合裁决；
+    最优解与唯一性仍按滑移次数与物理校正串字典序判定。缺省（None）时
+    为直读比特流，行为与既有版本完全一致。
     """
+    nrzi = line_code == "nrzi"
     sync_len = len(sync)
     frame_len = sync_len + payload_len + CRC_LEN
     total_len = frame_count * frame_len
@@ -167,22 +194,43 @@ def reconstruct(received: str, frame_count: int, sync: str, payload_len: int,
     rb = [ord(c) - ord("0") for c in received]
     sb = [ord(c) - ord("0") for c in sync]
 
+    if nrzi and _is_level(initial_level):
+        start_levels = (int(initial_level),)
+    elif nrzi:
+        start_levels = (0, 1)  # "unknown"：两个初始电平联合裁决
+    else:
+        start_levels = (0,)  # 直读模式：电平维度恒 0，发送符号即逻辑比特
+
     for budget in range(0, max_slippage + 1):
         answer = _run_budget(rb, sb, frame_count, frame_len, n, delta,
-                             budget)
+                             budget, nrzi, start_levels)
         if answer is not None:
             best_cost, finals = answer
-            tied = [(rep, count) for i, (c, rep, count) in finals.items()
-                    if i == n and c == best_cost]
-            corrected = min(rep for rep, _ in tied)
-            unique = len(tied) == 1 and tied[0][1] == 1
+            # 同档最优的不同物理校正串去重汇总（同一串只算一个）
+            best: dict[str, int] = {}
+            for (i, _lvl), (c, rep, count) in finals.items():
+                if i == n and c == best_cost:
+                    if rep in best:
+                        best[rep] = max(best[rep], count)
+                    else:
+                        best[rep] = count
+            corrected = min(best)
+            unique = len(best) == 1 and best[corrected] == 1
+            if nrzi:
+                # 首位逻辑比特必为同步字首比特：初始电平由物理校正串反推
+                init = (ord(corrected[0]) - ord("0")) ^ sb[0]
+                logical = _logical_from_physical(corrected, init)
+            else:
+                init = None
+                logical = None
             frames, events = _split_frames(corrected, received, sync,
-                                           payload_len, frame_len)
+                                           payload_len, frame_len, logical)
             return ReconstructionResult(
                 recoverable=True, corrected=corrected, frames=tuple(frames),
                 slippage_count=best_cost, events=tuple(events),
                 unique=unique, alternatives=0 if unique else 1,
                 minimum_slippage_lower_bound=None, budget=max_slippage,
+                initial_level=init,
             )
 
     lower_bound = max(max_slippage + 1, abs(delta))
@@ -193,60 +241,89 @@ def reconstruct(received: str, frame_count: int, sync: str, payload_len: int,
     )
 
 
-def _run_budget(rb, sb, frame_count, frame_len, n, delta, budget):
-    """在固定滑移预算下做分层帧 DP；成功返回 (best_cost, finals)。"""
+def _is_level(value) -> bool:
+    """是否为显式给定的初始电平 0/1（拒绝 bool 与 "unknown"）。"""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value in (0, 1))
+
+
+def _logical_from_physical(physical: str, initial_level: int) -> str:
+    """由物理电平串与初始电平差分还原逻辑比特流（1=翻转，0=保持）。"""
+    out = []
+    prev = initial_level
+    for ch in physical:
+        v = ord(ch) - ord("0")
+        out.append(chr(ord("0") + (prev ^ v)))
+        prev = v
+    return "".join(out)
+
+
+def _run_budget(rb, sb, frame_count, frame_len, n, delta, budget,
+                nrzi, start_levels):
+    """在固定滑移预算下做分层帧 DP；成功返回 (best_cost, finals)。
+
+    帧边界状态键为 ``(接收游标 i, 末电平 lvl)``：NRZI 模式下后续帧的
+    逻辑比特取决于跨帧带入的电平，直读模式下 lvl 恒为 0（行为与既有
+    版本逐状态一致）。
+    """
     sync_len = len(sb)
-    # 帧边界状态：{接收游标 i: (代价, 字典序最小校正前缀, 不同串标志)}
-    boundary: dict[int, tuple[int, str, int]] = {0: (0, "", 1)}
-    finals: dict[int, tuple[int, str, int]] = {}
+    # 帧边界状态：{(接收游标 i, 末电平): (代价, 字典序最小校正前缀, 不同串标志)}
+    boundary: dict[tuple[int, int], tuple[int, str, int]] = {
+        (0, lvl): (0, "", 1) for lvl in start_levels
+    }
+    finals: dict[tuple[int, int], tuple[int, str, int]] = {}
 
     for k in range(frame_count):
         if not boundary:
             return None
-        # 帧内状态：(i, cost, reg) -> (不同串标志, 字典序最小前缀)
-        cur: dict[tuple[int, int, int], tuple[int, str]] = {
-            (i, cost, 0): (count, rep)
-            for i, (cost, rep, count) in boundary.items()
+        # 帧内状态：(i, cost, reg, lvl) -> (不同串标志, 字典序最小前缀)
+        cur: dict[tuple[int, int, int, int], tuple[int, str]] = {
+            (i, cost, 0, lvl): (count, rep)
+            for (i, lvl), (cost, rep, count) in boundary.items()
         }
         sent_base = k * frame_len
 
         for j in range(frame_len):
             cur = _insertion_closure(cur, n, budget, sent_base + j, delta)
-            nxt: dict[tuple[int, int, int], tuple[int, str]] = {}
+            nxt: dict[tuple[int, int, int, int], tuple[int, str]] = {}
             expected = sb[j] if j < sync_len else None
             sent_here = sent_base + j
-            for (i, cost, reg), (count, rep) in cur.items():
-                # match：收发同位且必须相等
+            for (i, cost, reg, lvl), (count, rep) in cur.items():
+                # match：收发各消耗一位。NRZI 下接收的是电平，
+                # 逻辑比特 = 上一电平 XOR 当前电平；直读时电平即逻辑比特
                 if i < n:
-                    b = rb[i]
+                    v = rb[i]
+                    b = (lvl ^ v) if nrzi else v
                     if expected is None or b == expected:
                         ni, nc, nr = i + 1, cost, _crc_step(reg, b)
                         if _feasible(ni, nc, sent_here + 1, delta, budget):
-                            _merge(nxt, (ni, nc, nr), count, rep + str(b))
-                # deletion：漏失的发送位（同步字区域值唯一）
+                            _merge(nxt, (ni, nc, nr, v), count, rep + str(v))
+                # deletion：漏失的发送位（同步字区域逻辑值唯一）；
+                # 校正串记录物理电平（直读模式下电平即逻辑比特）
                 if cost < budget:
                     candidates = ((expected,) if expected is not None
                                   else (0, 1))
                     for b in candidates:
+                        v = (lvl ^ b) if nrzi else b
                         ni, nc = i, cost + 1
                         if _feasible(ni, nc, sent_here + 1, delta, budget):
-                            _merge(nxt, (ni, nc, _crc_step(reg, b)),
-                                   count, rep + str(b))
+                            _merge(nxt, (ni, nc, _crc_step(reg, b), v),
+                                   count, rep + str(v))
             cur = nxt
 
         cur = _insertion_closure(cur, n, budget, sent_base + frame_len, delta)
-        folded: dict[int, tuple[int, str, int]] = {}
-        for (i, cost, reg), (count, rep) in cur.items():
+        folded: dict[tuple[int, int], tuple[int, str, int]] = {}
+        for (i, cost, reg, lvl), (count, rep) in cur.items():
             if reg != 0:
                 continue
-            _fold(folded, i, cost, rep, count)
+            _fold(folded, (i, lvl), cost, rep, count)
 
         if k == frame_count - 1:
-            for i, v in folded.items():
-                _fold(finals, i, *v)
+            for key, v in folded.items():
+                _fold(finals, key, *v)
         boundary = folded
 
-    best_cost = min((c for i, (c, _, _) in finals.items() if i == n),
+    best_cost = min((c for (i, _lvl), (c, _, _) in finals.items() if i == n),
                     default=None)
     if best_cost is None:
         return None
@@ -264,21 +341,22 @@ def _feasible(i, cost, sent_done, delta, budget):
 
 
 def _insertion_closure(cur, n, budget, sent_done, delta):
-    """固定帧内偏移 j 上沿接收方向传播插入边 (i,c,r)->(i+1,c+1,r)。
+    """固定帧内偏移 j 上沿接收方向传播插入边。
 
-    校正串不变；用队列做有界 BFS，串标志沿用来源状态。
+    (i,c,r,lvl)->(i+1,c+1,r,lvl)：校正串与电平均不变；用队列做有界 BFS，
+    串标志沿用来源状态。
     """
     out = dict(cur)
     queue = deque(out.keys())
     while queue:
-        i, cost, reg = queue.popleft()
+        i, cost, reg, lvl = queue.popleft()
         if i >= n or cost >= budget:
             continue
         if not _feasible(i + 1, cost + 1, sent_done, delta, budget):
             continue
-        count, rep = out[(i, cost, reg)]
-        if _merge(out, (i + 1, cost + 1, reg), count, rep):
-            queue.append((i + 1, cost + 1, reg))
+        count, rep = out[(i, cost, reg, lvl)]
+        if _merge(out, (i + 1, cost + 1, reg, lvl), count, rep):
+            queue.append((i + 1, cost + 1, reg, lvl))
     return out
 
 
@@ -322,22 +400,28 @@ def _fold(table, i, cost, rep, count):
 
 
 def _split_frames(corrected: str, received: str, sync: str, payload_len: int,
-                  frame_len: int):
-    """切分校正串为逐帧结果，并用最小编辑对齐求插入/漏失事件位置。
+                  frame_len: int, logical: str | None = None):
+    """切分逐帧结果，并用最小编辑对齐求插入/漏失事件位置。
 
     位置基于校正串（发送侧）0 计位：
 
     * insertion：噪声位位于校正串该位置之前（0=流首，串长=流尾）；
     * deletion：漏失的发送比特位于校正串该位置，值取自校正串。
 
+    NRZI 模式下 ``corrected`` 为物理电平串、``logical`` 为差分还原的
+    逻辑流：帧载荷/CRC 取自逻辑流，事件位置与 bit 均为物理电平侧；
+    直读模式 ``logical`` 为 None，二者是同一串。
+
     相邻相同比特产生等价脚本时（例如在全 1 游程中插入一个 1，插入位
     置本质不可区分），采用正向贪心：能匹配就匹配，使事件位置尽量靠后，
     结果确定且每种报告都是对接收串的合法解释。
     """
     sync_len = len(sync)
+    physical = logical is not None
+    frame_stream = logical if physical else corrected
     frames = []
-    for k in range(0, len(corrected), frame_len):
-        raw = corrected[k:k + frame_len]
+    for k in range(0, len(frame_stream), frame_len):
+        raw = frame_stream[k:k + frame_len]
         frames.append(FrameResult(
             index=k // frame_len,
             payload=raw[sync_len:sync_len + payload_len],
@@ -376,11 +460,15 @@ def _split_frames(corrected: str, received: str, sync: str, payload_len: int,
         elif j < m and dp[i][j] == dp[i][j + 1] + 1:
             bit = corrected[j]
             fi, off = frame_of(j)
+            if physical:
+                detail = (f"帧 {fi} 内偏移 {off}（物理校正串位置 {j}）"
+                          f"的发送电平 {bit} 在接收流中漏失")
+            else:
+                detail = (f"帧 {fi} 内偏移 {off}（校正串位置 {j}）"
+                          f"的发送比特 {bit} 在接收流中漏失")
             events.append(SlipEvent(
                 kind="deletion", position=j, frame_index=fi,
-                offset=off, bit=bit,
-                detail=(f"帧 {fi} 内偏移 {off}（校正串位置 {j}）"
-                        f"的发送比特 {bit} 在接收流中漏失"),
+                offset=off, bit=bit, detail=detail,
             ))
             j += 1
         else:
@@ -392,10 +480,13 @@ def _split_frames(corrected: str, received: str, sync: str, payload_len: int,
                 where = "流尾"
             else:
                 where = f"位置 {j}"
+            if physical:
+                detail = f"噪声电平 {bit} 插入于物理校正串{where}之前"
+            else:
+                detail = f"噪声比特 {bit} 插入于校正串{where}之前"
             events.append(SlipEvent(
                 kind="insertion", position=j, frame_index=fi,
-                offset=off, bit=bit,
-                detail=f"噪声比特 {bit} 插入于校正串{where}之前",
+                offset=off, bit=bit, detail=detail,
             ))
             i += 1
     return frames, events

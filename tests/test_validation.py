@@ -91,6 +91,51 @@ class ValidationTests(unittest.TestCase):
                 self._ok(frame_count=bad)
             self.assertIn("frame_count", ctx.exception.fields)
 
+    def test_line_code_defaults_to_direct(self):
+        req = self._ok()
+        self.assertIsNone(req.line_code)
+        self.assertIsNone(req.initial_level)
+
+    def test_line_code_nrzi_pair_ok(self):
+        for il in (0, 1, "unknown"):
+            req = self._ok(line_code="nrzi", initial_level=il)
+            self.assertEqual(req.line_code, "nrzi")
+            self.assertEqual(req.initial_level, il)
+
+    def test_line_code_requires_initial_level(self):
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(line_code="nrzi")
+        self.assertIn("initial_level", ctx.exception.fields)
+
+    def test_initial_level_requires_line_code(self):
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(initial_level=1)
+        self.assertIn("line_code", ctx.exception.fields)
+
+    def test_line_code_bad_value(self):
+        for bad in ("rz", "NRZI", "manchester", 1, True):
+            with self.assertRaises(ValidationError) as ctx:
+                self._ok(line_code=bad, initial_level=0)
+            self.assertIn("line_code", ctx.exception.fields)
+
+    def test_initial_level_bad_values(self):
+        for bad in (2, -1, "0", "1", "UNKNOWN", True, False, 0.0, 1.0):
+            with self.assertRaises(ValidationError) as ctx:
+                self._ok(line_code="nrzi", initial_level=bad)
+            self.assertIn("initial_level", ctx.exception.fields)
+
+    def test_line_code_bad_value_and_missing_pair_reported_together(self):
+        # line_code 非法且 initial_level 缺失：两个字段错误应同时聚合
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(line_code="manchester")
+        self.assertIn("line_code", ctx.exception.fields)
+        self.assertIn("initial_level", ctx.exception.fields)
+        # initial_level 非法且 line_code 缺失：同理
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(initial_level=7)
+        self.assertIn("line_code", ctx.exception.fields)
+        self.assertIn("initial_level", ctx.exception.fields)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

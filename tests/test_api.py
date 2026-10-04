@@ -20,6 +20,15 @@ def make_frame(sync, payload):
     return body + format(crc8(body), "08b")
 
 
+def nrzi_encode(logical, initial_level):
+    out = []
+    lvl = initial_level
+    for ch in logical:
+        lvl ^= int(ch)
+        out.append(str(lvl))
+    return "".join(out)
+
+
 class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -200,6 +209,120 @@ class ApiTests(unittest.TestCase):
     def test_unknown_route(self):
         status, _ = self._request("/nope", method="GET")
         self.assertEqual(status, 404)
+
+    def test_recover_nrzi_cross_frame_continuation(self):
+        """NRZI 线电平直接复原：初始电平未知，跨帧电平延续。"""
+        rng = random.Random(21)
+        sync = "11010011"
+        plen = 18
+        nf = 4
+        frames = [make_frame(sync, "".join(rng.choice("01") for _ in range(plen)))
+                  for _ in range(nf)]
+        logical = "".join(frames)
+        init = 1
+        physical = nrzi_encode(logical, init)
+        fl = len(sync) + plen + 8
+        # 构造自检：至少一个帧边界带入电平为 1（逐帧重置 NRZI 必然译错）
+        self.assertIn(1, [int(physical[k * fl - 1]) for k in range(1, nf)])
+        # 一漏一插分别落在第 2、3 帧，位置取孤立电平以保证唯一解
+        del_pos = next(p for p in range(fl + 1, 2 * fl - 1)
+                       if (physical[p] != physical[p - 1]
+                           and physical[p] != physical[p + 1]))
+        ins_pos = next(p for p in range(2 * fl + 1, 3 * fl - 1)
+                       if physical[p - 1] == "0" and physical[p] == "0")
+        damaged = physical[:ins_pos] + "1" + physical[ins_pos:]
+        damaged = damaged[:del_pos] + damaged[del_pos + 1:]
+        status, body = self._request("/api/v1/recover", {
+            "received": damaged, "frame_count": nf, "sync": sync,
+            "payload_len": plen, "max_slippage": 6,
+            "line_code": "nrzi", "initial_level": "unknown",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"], body)
+        self.assertEqual(body["initial_level"], init)
+        self.assertEqual(body["corrected"], physical)
+        self.assertEqual(body["slippage_count"], 2)
+        self.assertEqual(sorted(e["kind"] for e in body["events"]),
+                         ["deletion", "insertion"])
+        self.assertEqual([f["raw"] for f in body["frames"]], frames)
+        for i, f in enumerate(body["frames"]):
+            self.assertEqual(f["payload"],
+                             frames[i][len(sync):len(sync) + plen])
+            self.assertEqual(f["crc"], frames[i][-8:])
+
+    def test_recover_nrzi_known_initial_level(self):
+        rng = random.Random(22)
+        sync = "10110011"
+        frames = [make_frame(sync, "".join(rng.choice("01") for _ in range(16)))
+                  for _ in range(3)]
+        logical = "".join(frames)
+        physical = nrzi_encode(logical, 0)
+        status, body = self._request("/api/v1/recover", {
+            "received": physical, "frame_count": 3, "sync": sync,
+            "payload_len": 16, "max_slippage": 6,
+            "line_code": "nrzi", "initial_level": 0,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"])
+        self.assertEqual(body["initial_level"], 0)
+        self.assertEqual(body["corrected"], physical)
+        self.assertEqual(body["slippage_count"], 0)
+        self.assertEqual([f["raw"] for f in body["frames"]], frames)
+
+    def test_recover_nrzi_over_budget_no_partials(self):
+        rng = random.Random(23)
+        sync = "11001100"
+        frames = [make_frame(sync, "".join(rng.choice("01") for _ in range(16)))
+                  for _ in range(3)]
+        physical = nrzi_encode("".join(frames), 1)
+        damaged = physical + "0101010"  # 长度差 7 > 预算 6
+        status, body = self._request("/api/v1/recover", {
+            "received": damaged, "frame_count": 3, "sync": sync,
+            "payload_len": 16, "max_slippage": 6,
+            "line_code": "nrzi", "initial_level": "unknown",
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(body["recoverable"])
+        self.assertNotIn("frames", body)
+        self.assertNotIn("corrected", body)
+        self.assertNotIn("initial_level", body)
+        self.assertGreaterEqual(body["minimum_slippage_lower_bound"], 7)
+
+    def test_nrzi_field_validation(self):
+        base = {
+            "received": "010101", "frame_count": 3, "sync": "111000101",
+            "payload_len": 16, "max_slippage": 6,
+        }
+        # line_code 缺 initial_level
+        status, body = self._request("/api/v1/recover", {
+            **base, "line_code": "nrzi"})
+        self.assertEqual(status, 422)
+        self.assertIn("initial_level", body["fields"])
+        # initial_level 缺 line_code
+        status, body = self._request("/api/v1/recover", {
+            **base, "initial_level": "unknown"})
+        self.assertEqual(status, 422)
+        self.assertIn("line_code", body["fields"])
+        # 两者取值均非法
+        status, body = self._request("/api/v1/recover", {
+            **base, "line_code": "manchester", "initial_level": 2})
+        self.assertEqual(status, 422)
+        self.assertIn("line_code", body["fields"])
+        self.assertIn("initial_level", body["fields"])
+
+    def test_legacy_response_has_no_initial_level(self):
+        # 未提供 line_code 时响应保持兼容：不含 initial_level
+        rng = random.Random(24)
+        sync = "111000101"
+        frames = [make_frame(sync, "".join(rng.choice("01") for _ in range(16)))
+                  for _ in range(3)]
+        status, body = self._request("/api/v1/recover", {
+            "received": "".join(frames), "frame_count": 3, "sync": sync,
+            "payload_len": 16, "max_slippage": 6,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"])
+        self.assertNotIn("initial_level", body)
 
 
 if __name__ == "__main__":

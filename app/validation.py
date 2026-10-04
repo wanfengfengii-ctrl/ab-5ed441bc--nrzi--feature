@@ -30,6 +30,8 @@ class RecoverRequest:
     sync: str
     payload_len: int
     max_slippage: int
+    line_code: str | None = None   # None=直读比特流；"nrzi"=NRZI 线电平
+    initial_level: object = None   # None / 0 / 1 / "unknown"
 
 
 def _is_int(value) -> bool:
@@ -100,7 +102,25 @@ def validate(data: object) -> RecoverRequest:
     elif not (0 <= ms <= SLIPPAGE_MAX_LIMIT):
         errors["max_slippage"] = f"必须在 0..{SLIPPAGE_MAX_LIMIT} 之间"
 
+    # line_code 与 initial_level：可选，但必须成对出现；缺省时为直读模式
+    lc = data.get("line_code")
+    il = data.get("initial_level")
+    if lc is not None and lc != "nrzi":
+        errors["line_code"] = '目前仅支持 "nrzi"（缺省为直读比特流）'
+    if il is not None and not (
+            il == "unknown" or (_is_int(il) and il in (0, 1))):
+        errors["initial_level"] = '必须是 0、1 或 "unknown"'
+    if lc is not None and il is None:
+        errors.setdefault(
+            "initial_level",
+            '与 line_code 搭配必填：0、1 或 "unknown"（首个发送位之前的电平）')
+    if il is not None and lc is None:
+        errors.setdefault(
+            "line_code",
+            '与 initial_level 搭配必填："nrzi"')
+
     if errors:
         raise ValidationError(errors)
 
-    return RecoverRequest(received, fc, sync, pl, ms)
+    return RecoverRequest(received, fc, sync, pl, ms,
+                          line_code=lc, initial_level=il)

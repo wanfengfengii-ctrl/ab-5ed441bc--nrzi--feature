@@ -6,8 +6,10 @@
 
 - 纯 Python 3.11 标准库实现，**零第三方运行时依赖**。
 - 常驻 HTTP API，端口由 `TELEMETRY_PORT` 配置，带健康检查。
-- 一次性 `verify` 服务：构建检查 + 单元测试 + 含伪同步字的端到端冒烟，
-  以退出码汇总结果。
+- 可选 **NRZI 线电平**直接复原（`line_code="nrzi"` + `initial_level`），
+  编码状态跨帧连续，无需先差分解码。
+- 一次性 `verify` 服务：构建检查 + 单元测试 + 含伪同步字与 NRZI 跨帧
+  电平延续的端到端冒烟，以退出码汇总结果。
 
 ## 帧与 CRC
 
@@ -29,6 +31,24 @@
 - `deletion`：发送的一位在接收流中缺失（接收侧不消耗位）。
 
 比特翻转等价于「同位置一次漏失 + 一次插入」（代价 2）。
+
+## NRZI 线电平（可选）
+
+部分接收机失锁排障时只导出**连续 NRZI 线电平**。请求同时携带
+`line_code="nrzi"` 与 `initial_level` 即可直接复原逻辑帧，无需先差分
+解码（避免单个漏采电平污染后续判读）：
+
+- 逻辑 `1` 翻转电平、逻辑 `0` 保持电平，编码状态**跨帧连续**，
+  绝不逐帧重置；
+- `initial_level` 为首个发送位之前的电平：`0`、`1` 或 `"unknown"`
+  （未知时由求解器把两个候选电平放进同一动态规划联合裁决）；
+- 求解器联合裁决初始电平、物理校正串、逻辑帧与插入/漏失，最优解与
+  唯一性仍按**滑移次数**与**物理校正串字典序**判定；
+- 成功响应额外返回推定的 `initial_level`；`corrected` 为**物理电平串**，
+  `frames` 为差分还原后的**逻辑帧**（载荷/CRC 均为逻辑比特），
+  `events[].bit` 为**物理电平**；
+- 两字段必须成对出现，任一缺失或取值非法均按 422 字段错误处理；
+  缺省时请求、响应与裁决与直读模式完全一致。
 
 ## 复原准则
 
@@ -64,6 +84,20 @@
 }
 ```
 
+NRZI 线电平请求（`received` 为连续线电平而非逻辑比特）：
+
+```json
+{
+  "received": "11001100…10",
+  "frame_count": 3,
+  "sync": "10101011",
+  "payload_len": 18,
+  "max_slippage": 6,
+  "line_code": "nrzi",
+  "initial_level": "unknown"
+}
+```
+
 | 字段 | 类型 | 范围 |
 | --- | --- | --- |
 | `received` | string | 非空，仅含 `0`/`1` |
@@ -71,6 +105,8 @@
 | `sync` | string | 6..12 位 `0`/`1` |
 | `payload_len` | int | 16..48 |
 | `max_slippage` | int | 0..6 |
+| `line_code` | string | 可选，仅 `"nrzi"`；须与 `initial_level` 成对 |
+| `initial_level` | int/string | 可选，`0`、`1` 或 `"unknown"`；须与 `line_code` 成对 |
 
 成功（HTTP 200，`recoverable=true`）：
 
@@ -97,6 +133,9 @@
 
 - `events[].position` 基于校正串（发送侧）0 计位；插入位在该位置之前
   （0 = 流首，串长 = 流尾），漏失位即该位置。
+- NRZI 模式（`line_code="nrzi"` + `initial_level`）下成功响应额外包含
+  推定的 `"initial_level": 0|1`，`corrected` 为物理电平串，`frames`
+  为逻辑帧，`events[].bit` 为物理电平。
 - 不可复原（HTTP 200，`recoverable=false`）：
 
 ```json
@@ -138,8 +177,9 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 `verify` 汇总三项，全过退出码为 0：
 
 - `build`：全部源文件字节码编译检查；
-- `tests`：`tests/` 全套单元 / 对拍 / HTTP 测试；
-- `smoke`：健康检查、含**伪同步字陷阱**的复原、超预算下界、非法字段错误。
+- `tests`：`tests/` 全套单元 / 对拍 / HTTP 测试（含 NRZI 穷举对拍）；
+- `smoke`：健康检查、含**伪同步字陷阱**的复原、**NRZI 跨帧电平延续**
+  复原、超预算下界、非法字段错误。
 
 ## 本地开发（无需 Docker）
 
@@ -152,10 +192,10 @@ TELEMETRY_PORT=8080 python3 -m app.server  # 启动 API
 目录：
 
 ```
-app/core.py        # CRC-8、联合复原 DP、事件定位
-app/validation.py  # 入参校验（逐字段错误）
+app/core.py        # CRC-8、联合复原 DP（含 NRZI 电平维度）、事件定位
+app/validation.py  # 入参校验（逐字段错误，含 line_code/initial_level 成对校验）
 app/server.py      # 标准库 HTTP API + 健康检查
 app/verify.py      # 一次性自检（构建/测试/冒烟 + 退出码）
-tests/             # CRC、求解器对拍、校验、HTTP 端到端测试
+tests/             # CRC、求解器对拍（直读 + NRZI）、校验、HTTP 端到端测试
 Dockerfile, docker-compose.yml
 ```
