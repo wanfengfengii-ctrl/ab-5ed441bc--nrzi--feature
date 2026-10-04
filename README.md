@@ -33,10 +33,12 @@
 ## 复原准则
 
 在整条接收流上做带 CRC 寄存器状态的分层动态规划（状态含接收游标、帧内
-偏移、已用滑移、CRC 余数），转移只允许匹配 / 漏失 / 插入：
+偏移、已用滑移、CRC 余数；NRZI 模式再含**跨帧连续电平**与初始电平候选），
+转移只允许匹配 / 漏失 / 插入：
 
 1. **先最小化滑移次数**（预算 0..`max_slippage` ≤ 6，逐档求解）；
-2. 滑移次数相同的解中，取**校正串字典序最小**者；
+2. 滑移次数相同的解中，取**校正串字典序最小**者（NRZI 模式按**物理**
+   校正串字典序）；
 3. 枚举同代价的不同校正串，报告最优解 `unique`（唯一）或存在其他
    同代价校正串（`alternatives ≥ 1`）。
 
@@ -71,17 +73,48 @@
 | `sync` | string | 6..12 位 `0`/`1` |
 | `payload_len` | int | 16..48 |
 | `max_slippage` | int | 0..6 |
+| `line_code` | string | 可选，`direct`（默认）或 `nrzi` |
+| `initial_level` | string | 仅 NRZI 模式必填：`"0"`、`"1"` 或 `"unknown"` |
+
+### NRZI 线电平模式
+
+部分接收机失锁排障时只导出连续的 **NRZI 线电平**（物理电平），值班员
+需要直接在物理流上复原逻辑帧，避免先做逐位差分解码后，单个漏采电平污染
+后续全部判读。请求同时给出 `line_code="nrzi"` 与 `initial_level`：
+
+- NRZI 约定：逻辑 **1 翻转**电平、逻辑 **0 保持**电平；
+- 编码状态**跨帧连续**，求解器绝不逐帧重置电平；
+- `initial_level` 为首个发送位之前的电平：`"0"`/`"1"` 固定，`"unknown"`
+  时两个候选与物理校正串、逻辑帧、插入/漏失一起**联合裁决**；
+- 两字段任一缺失或取值非法均按字段返回 422；直接模式不得携带
+  `initial_level`；
+- 成功结果额外返回推定的 `initial_level`；`corrected` 与 `events[].bit`
+  均为**物理电平**，`frames[]` 的载荷/CRC 为解码后的**逻辑位**；
+- 最优解仍按滑移次数与**物理校正串**字典序裁决并判定唯一性。
+
+```json
+{
+  "received": "10101011…01",
+  "frame_count": 3,
+  "sync": "10101011",
+  "payload_len": 18,
+  "max_slippage": 6,
+  "line_code": "nrzi",
+  "initial_level": "unknown"
+}
+```
 
 成功（HTTP 200，`recoverable=true`）：
 
 ```json
 {
   "recoverable": true,
-  "corrected": "1010…（重建的完整发送比特串）",
+  "corrected": "1010…（重建的完整发送比特串；NRZI 模式为物理电平串）",
   "slippage_count": 2,
   "unique": true,
   "alternatives": 0,
   "budget": 6,
+  "initial_level": "0",
   "frames": [
     {"index": 0, "payload": "…18 位…", "crc": "11001010",
      "raw": "同步字+载荷+CRC 整帧"}
@@ -96,7 +129,8 @@
 ```
 
 - `events[].position` 基于校正串（发送侧）0 计位；插入位在该位置之前
-  （0 = 流首，串长 = 流尾），漏失位即该位置。
+  （0 = 流首，串长 = 流尾），漏失位即该位置。NRZI 模式下 `corrected` 与
+  `events[].bit` 均为物理电平；`initial_level` 字段仅 NRZI 模式返回。
 - 不可复原（HTTP 200，`recoverable=false`）：
 
 ```json
@@ -139,7 +173,8 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 
 - `build`：全部源文件字节码编译检查；
 - `tests`：`tests/` 全套单元 / 对拍 / HTTP 测试；
-- `smoke`：健康检查、含**伪同步字陷阱**的复原、超预算下界、非法字段错误。
+- `smoke`：健康检查、含**伪同步字陷阱**的复原、超预算下界、非法字段
+  错误、NRZI 跨帧电平延续与初始电平裁决。
 
 ## 本地开发（无需 Docker）
 

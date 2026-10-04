@@ -91,6 +91,42 @@ class ValidationTests(unittest.TestCase):
                 self._ok(frame_count=bad)
             self.assertIn("frame_count", ctx.exception.fields)
 
+    def test_defaults_without_line_code(self):
+        req = self._ok()
+        self.assertEqual(req.line_code, "direct")
+        self.assertIsNone(req.initial_level)
+
+    def test_nrzi_requires_initial_level(self):
+        # 有 line_code=nrzi 但缺 initial_level -> 字段报错
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(line_code="nrzi")
+        self.assertIn("initial_level", ctx.exception.fields)
+        # initial_level 非法
+        for bad in ("2", "true", 0, 1, True, None, "UNKNOWN"):
+            with self.assertRaises(ValidationError) as ctx:
+                self._ok(line_code="nrzi", initial_level=bad)
+            self.assertIn("initial_level", ctx.exception.fields, bad)
+        # line_code 非法
+        for bad in ("NRZI", "nrz", 1, True, None):
+            with self.assertRaises(ValidationError) as ctx:
+                self._ok(line_code=bad, initial_level="0")
+            self.assertIn("line_code", ctx.exception.fields, bad)
+
+    def test_nrzi_valid_initial_levels(self):
+        for label in ("0", "1", "unknown"):
+            req = self._ok(line_code="nrzi", initial_level=label)
+            self.assertEqual(req.line_code, "nrzi")
+            self.assertEqual(req.initial_level, label)
+
+    def test_initial_level_without_nrzi_is_rejected(self):
+        # 直接模式提供 initial_level -> 字段报错（不能静默忽略）
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(initial_level="0")
+        self.assertIn("initial_level", ctx.exception.fields)
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(line_code="direct", initial_level="unknown")
+        self.assertIn("initial_level", ctx.exception.fields)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

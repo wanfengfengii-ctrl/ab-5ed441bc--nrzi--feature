@@ -201,6 +201,99 @@ def smoke() -> bool:
                 body.get("fields", {})):
             ok = False
             print("  FAIL：应给出全部问题字段的明确错误")
+
+        # 6) NRZI 线电平：跨帧电平延续 + 初始电平联合裁决
+        def nrzi_encode(bits, init):
+            out, lev = [], init
+            for b in bits:
+                if b == "1":
+                    lev ^= 1
+                out.append(str(lev))
+            return "".join(out)
+
+        rng2 = random.Random(909)
+        nsync = "10101011"
+        nplen, nnf = 18, 3
+        nframes = [
+            nsync + "".join(rng2.choice("01") for _ in range(nplen))
+            for _ in range(nnf)
+        ]
+        nframes = [fb + format(crc8(fb), "08b") for fb in nframes]
+        nlogical = "".join(nframes)
+        nframe_len = len(nsync) + nplen + 8
+        nphysical = nrzi_encode(nlogical, 0)
+        # 分别在第 1、2、3 帧区域制造漏失/插入，电平必须跨帧连续解释
+        ndamaged = (nphysical[:7] + nphysical[8:nframe_len + 4]
+                    + "0" + nphysical[nframe_len + 4:2 * nframe_len + 1]
+                    + nphysical[2 * nframe_len + 2:])
+        status, body = post("/api/v1/recover", {
+            "received": ndamaged, "frame_count": nnf, "sync": nsync,
+            "payload_len": nplen, "max_slippage": 6,
+            "line_code": "nrzi", "initial_level": "unknown",
+        })
+        print(f"  POST NRZI 跨帧电平 -> {status}, "
+              f"initial_level={body.get('initial_level')}, "
+              f"slippage={body.get('slippage_count')}")
+        if status != 200 or not body.get("recoverable"):
+            ok = False
+            print("  FAIL：NRZI 流应在预算内可复原")
+        else:
+            if body.get("initial_level") != "0":
+                ok = False
+                print("  FAIL：应推定初始电平为 0")
+            if body.get("corrected") != nphysical:
+                ok = False
+                print("  FAIL：物理校正串与原物理电平流不一致")
+            if body.get("slippage_count") != 3:
+                ok = False
+                print("  FAIL：滑移次数应为 3")
+            for i, f in enumerate(body.get("frames", [])):
+                if f.get("raw") != nframes[i]:
+                    ok = False
+                    print(f"  FAIL：帧 {i} 逻辑载荷/CRC 与发送帧不一致")
+            # 事件 bit 必须是物理电平且可回放为接收物理串
+            s = body["corrected"]
+            for ev in sorted(body["events"],
+                             key=lambda e: e["position"], reverse=True):
+                if ev["kind"] == "deletion":
+                    s = s[:ev["position"]] + s[ev["position"] + 1:]
+                else:
+                    s = s[:ev["position"]] + ev["bit"] + s[ev["position"]:]
+            if s != ndamaged:
+                ok = False
+                print("  FAIL：事件回放与接收物理电平串不一致")
+            else:
+                touched = {e["frame_index"] for e in body["events"]}
+                print(f"  NRZI 事件触及帧 {sorted(touched)}，"
+                      f"事件 bit 均为物理电平")
+
+        # 7) NRZI 字段校验：initial_level 缺失/非法均逐字段报错
+        status, body = post("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": nsync,
+            "payload_len": nplen, "max_slippage": 6,
+            "line_code": "nrzi",
+        })
+        if status != 422 or "initial_level" not in body.get("fields", {}):
+            ok = False
+            print(f"  FAIL：NRZI 缺 initial_level 应 422 字段报错，"
+                  f"实际 {status} {body}")
+        status, body = post("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": nsync,
+            "payload_len": nplen, "max_slippage": 6,
+            "line_code": "nrzi", "initial_level": "high",
+        })
+        if status != 422 or "initial_level" not in body.get("fields", {}):
+            ok = False
+            print(f"  FAIL：非法 initial_level 应 422 字段报错，"
+                  f"实际 {status}")
+        status, body = post("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": nsync,
+            "payload_len": nplen, "max_slippage": 6,
+            "initial_level": "0",
+        })
+        if status != 422 or "initial_level" not in body.get("fields", {}):
+            ok = False
+            print("  FAIL：直接模式误带 initial_level 应 422 字段报错")
     except Exception:  # noqa: BLE001
         ok = False
         traceback.print_exc()

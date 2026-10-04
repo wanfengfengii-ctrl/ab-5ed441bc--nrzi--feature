@@ -16,6 +16,10 @@ from .core import (
 
 RECEIVED_MAX_LEN = 4096  # 远大于 8 帧 * 68 位 + 滑移余量，防止异常巨量输入
 
+# 线编码与初始电平的合法取值
+LINE_CODES = ("direct", "nrzi")
+INITIAL_LEVELS = ("0", "1", "unknown")
+
 
 class ValidationError(Exception):
     def __init__(self, fields: dict[str, str]):
@@ -30,6 +34,9 @@ class RecoverRequest:
     sync: str
     payload_len: int
     max_slippage: int
+    line_code: str = "direct"
+    # NRZI 模式首个发送位之前的电平："0"/"1"/"unknown"；直接模式为 None
+    initial_level: str | None = None
 
 
 def _is_int(value) -> bool:
@@ -100,7 +107,34 @@ def validate(data: object) -> RecoverRequest:
     elif not (0 <= ms <= SLIPPAGE_MAX_LIMIT):
         errors["max_slippage"] = f"必须在 0..{SLIPPAGE_MAX_LIMIT} 之间"
 
+    # line_code（可选；缺省走直接模式，保持向后兼容；显式 null 视为非法）
+    raw_lc = data.get("line_code")
+    line_code = "direct"
+    if "line_code" in data:
+        if not isinstance(raw_lc, str) or raw_lc not in LINE_CODES:
+            errors["line_code"] = "必须是字符串，取值为 direct 或 nrzi"
+        else:
+            line_code = raw_lc
+
+    # initial_level（仅 NRZI 模式有效，且与 line_code=nrzi 成对出现）
+    il = data.get("initial_level")
+    il_present = "initial_level" in data and il is not None
+    initial_level = None
+    if raw_lc == "nrzi":
+        if not il_present:
+            errors["initial_level"] = (
+                "必填：NRZI 模式首个发送位之前的电平"
+                "（\"0\"、\"1\" 或 \"unknown\"）")
+        elif not isinstance(il, str) or il not in INITIAL_LEVELS:
+            errors["initial_level"] = (
+                "必须是字符串 \"0\"、\"1\" 或 \"unknown\"")
+        else:
+            initial_level = il
+    elif il_present:
+        errors["initial_level"] = "仅在线编码 line_code=nrzi 时提供"
+
     if errors:
         raise ValidationError(errors)
 
-    return RecoverRequest(received, fc, sync, pl, ms)
+    return RecoverRequest(received, fc, sync, pl, ms, line_code,
+                          initial_level)

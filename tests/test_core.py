@@ -11,6 +11,7 @@ from app.core import (  # noqa: E402
     CRC_POLY,
     crc8,
     frame_is_valid,
+    nrzi_decode,
     reconstruct,
 )
 
@@ -18,6 +19,17 @@ from app.core import (  # noqa: E402
 def make_frame(sync: str, payload: str) -> str:
     body = sync + payload
     return body + format(crc8(body), "08b")
+
+
+def nrzi_encode(bits: str, initial_level: int) -> str:
+    """NRZI 编码：逻辑 1 翻转电平、逻辑 0 保持电平。"""
+    out = []
+    lev = initial_level
+    for b in bits:
+        if b == "1":
+            lev ^= 1
+        out.append(str(lev))
+    return "".join(out)
 
 
 def edit_distance_ins_del(a: str, b: str) -> int:
@@ -276,6 +288,212 @@ class OptimalityTests(unittest.TestCase):
             self.assertEqual(r.corrected, min(best))
             self.assertEqual(r.unique, len(best) == 1)
             checked += 1
+        self.assertGreater(checked, 20)
+
+
+class NrziTests(unittest.TestCase):
+    """NRZI 线电平模式：电平状态跨帧连续、初始电平联合裁决。"""
+
+    def setUp(self):
+        self.rng = random.Random(55)
+        self.sync = "111000101"
+        self.plen = 16
+        self.nf = 4
+        self.frames = [
+            make_frame(self.sync,
+                       "".join(self.rng.choice("01")
+                               for _ in range(self.plen)))
+            for _ in range(self.nf)
+        ]
+        self.logical = "".join(self.frames)
+        # 初始电平 1
+        self.init = 1
+        self.physical = nrzi_encode(self.logical, self.init)
+
+    def _check_frames(self, r):
+        self.assertEqual(len(r.frames), self.nf)
+        for i, f in enumerate(r.frames):
+            self.assertEqual(f.raw, self.frames[i])
+            self.assertTrue(frame_is_valid(f.raw, self.sync, self.plen))
+
+    def test_clean_with_known_initial_level(self):
+        for label, value in (("0", 0), ("1", 1)):
+            phys = nrzi_encode(self.logical, value)
+            r = reconstruct(phys, self.nf, self.sync, self.plen, 0,
+                            line_code="nrzi", initial_level=label)
+            self.assertTrue(r.recoverable)
+            self.assertEqual(r.slippage_count, 0)
+            self.assertEqual(r.corrected, phys)  # corrected 是物理电平串
+            self.assertEqual(r.initial_level, label)
+            self.assertTrue(r.unique)
+            self.assertEqual(r.events, ())
+            self._check_frames(r)
+
+    def test_unknown_initial_level_is_adjudicated(self):
+        r = reconstruct(self.physical, self.nf, self.sync, self.plen, 0,
+                        line_code="nrzi", initial_level="unknown")
+        self.assertTrue(r.recoverable)
+        self.assertEqual(r.slippage_count, 0)
+        self.assertEqual(r.initial_level, str(self.init))
+        self.assertEqual(r.corrected, self.physical)
+        self._check_frames(r)
+
+    def test_wrong_initial_level_not_recoverable_within_budget(self):
+        wrong = "0" if self.init == 1 else "1"
+        r = reconstruct(self.physical, self.nf, self.sync, self.plen, 0,
+                        line_code="nrzi", initial_level=wrong)
+        self.assertFalse(r.recoverable)
+        self.assertIsNone(r.corrected)
+        self.assertEqual(r.frames, ())
+
+    def test_state_continues_across_frames(self):
+        # 若逐帧重置电平，解码出的第 2..n 帧逻辑流将与发送帧不同；
+        # 正确实现跨帧延续，故零滑移即可整流复原。
+        r = reconstruct(self.physical, self.nf, self.sync, self.plen, 0,
+                        line_code="nrzi", initial_level=str(self.init))
+        self.assertTrue(r.recoverable)
+        self._check_frames(r)
+
+    def test_insertion_and_deletion_in_physical_stream(self):
+        damaged = (self.physical[:10] + "0" + self.physical[10:40]
+                   + self.physical[41:])
+        r = reconstruct(damaged, self.nf, self.sync, self.plen, 6,
+                        line_code="nrzi", initial_level="unknown")
+        self.assertTrue(r.recoverable)
+        self.assertEqual(r.slippage_count, 2)
+        self.assertEqual(r.corrected, self.physical)
+        self.assertEqual(r.initial_level, str(self.init))
+        self.assertEqual(sorted(e.kind for e in r.events),
+                         ["deletion", "insertion"])
+        # 事件 bit 必须是物理电平：用物理接收串回放
+        s = r.corrected
+        for ev in sorted(r.events, key=lambda e: e.position, reverse=True):
+            if ev.kind == "deletion":
+                s = s[:ev.position] + s[ev.position + 1:]
+            else:
+                s = s[:ev.position] + ev.bit + s[ev.position:]
+        self.assertEqual(s, damaged)
+        self._check_frames(r)
+
+    def test_event_bits_are_physical_levels(self):
+        # 在一个物理电平上做删除，事件 bit 必须等于该物理电平
+        pos = 20
+        phys_bit = self.physical[pos]
+        damaged = self.physical[:pos] + self.physical[pos + 1:]
+        r = reconstruct(damaged, self.nf, self.sync, self.plen, 2,
+                        line_code="nrzi", initial_level=str(self.init))
+        self.assertTrue(r.recoverable)
+        ev = next(e for e in r.events if e.kind == "deletion")
+        self.assertEqual(ev.position, pos)
+        self.assertEqual(ev.bit, phys_bit)
+
+    def test_direct_mode_field_is_none(self):
+        r = reconstruct(self.physical, self.nf, self.sync, self.plen, 6)
+        # 直接模式不感知 NRZI；结果中不应出现 initial_level
+        self.assertIsNone(r.initial_level)
+        d = r.to_dict()
+        self.assertNotIn("initial_level", d)
+
+    def test_nrzi_result_dict_contains_initial_level(self):
+        r = reconstruct(self.physical, self.nf, self.sync, self.plen, 0,
+                        line_code="nrzi", initial_level="1")
+        d = r.to_dict()
+        self.assertEqual(d["initial_level"], "1")
+
+    @staticmethod
+    def brute_nrzi(recv, nf, sync, plen, budget, init_level):
+        """物理域朴素穷举：候选为物理校正串，逻辑帧经 NRZI 解码后校验。"""
+        sl = len(sync)
+        fl = sl + plen + 8
+
+        def step(reg, b):
+            v = reg ^ (b << 7)
+            return (((v << 1) ^ 0x07) & 0xFF
+                    if v & 0x80 else ((v << 1) & 0xFF))
+
+        found = set()
+
+        def rec(ri, k, j, reg, lev, corr, cost):
+            if cost > budget:
+                return
+            if k == nf:
+                if ri == len(recv):
+                    found.add(corr)
+                return
+            if j == fl:
+                if reg == 0:
+                    rec(ri, k + 1, 0, 0, lev, corr, cost)
+                return
+            # 插入
+            if ri < len(recv):
+                rec(ri + 1, k, j, reg, lev, corr, cost + 1)
+            # 发送位：候选逻辑位（同步字区域唯一）
+            logical_cands = ((int(sync[j]),) if j < sl else (0, 1))
+            for lb in logical_cands:
+                pb = lev ^ lb  # 该逻辑位对应的物理电平
+                nlev = pb
+                if ri < len(recv) and int(recv[ri]) == pb:
+                    rec(ri + 1, k, j + 1, step(reg, lb), nlev,
+                        corr + str(pb), cost)
+                rec(ri, k, j + 1, step(reg, lb), nlev,
+                    corr + str(pb), cost + 1)
+
+        rec(0, 0, 0, 0, init_level, "", 0)
+        return found
+
+    def test_matches_brute_force_nrzi(self):
+        rng = random.Random(2024)
+        checked = 0
+        for trial in range(50):
+            slen = rng.randint(6, 7)
+            plen = rng.randint(16, 18)
+            nf = 3
+            sync = "".join(rng.choice("01") for _ in range(slen))
+            stream = ""
+            for _ in range(nf):
+                body = sync + "".join(rng.choice("01") for _ in range(plen))
+                stream += body + format(crc8(body), "08b")
+            init = rng.randint(0, 1)
+            phys = nrzi_encode(stream, init)
+            damaged = phys
+            for _ in range(rng.randint(0, 2)):
+                p = rng.randrange(len(damaged))
+                if rng.random() < 0.5:
+                    damaged = damaged[:p] + damaged[p + 1:]
+                else:
+                    damaged = damaged[:p] + rng.choice("01") + damaged[p:]
+            budget = rng.randint(1, 2)
+            for label, value in (("unknown", None), (str(init), init)):
+                r = reconstruct(damaged, nf, sync, plen, budget,
+                                line_code="nrzi",
+                                initial_level=label)
+                if value is None:
+                    opt = (self.brute_nrzi(damaged, nf, sync, plen, budget, 0)
+                           | self.brute_nrzi(damaged, nf, sync, plen,
+                                             budget, 1))
+                else:
+                    opt = self.brute_nrzi(damaged, nf, sync, plen, budget,
+                                          value)
+                if not opt:
+                    self.assertFalse(r.recoverable, (trial, label))
+                    continue
+                costs = {x: edit_distance_ins_del(damaged, x) for x in opt}
+                best_cost = min(costs.values())
+                best = {x for x, c in costs.items() if c == best_cost}
+                self.assertTrue(r.recoverable, (trial, label))
+                self.assertEqual(r.slippage_count, best_cost)
+                self.assertEqual(r.corrected, min(best))
+                self.assertEqual(r.unique, len(best) == 1)
+                if label != "unknown":
+                    self.assertEqual(r.initial_level, str(init))
+                # 物理校正串按推定初始电平解码必须为合法逻辑帧流
+                dec = nrzi_decode(r.corrected, int(r.initial_level))
+                self.assertEqual(len(dec), nf * (slen + plen + 8))
+                for k in range(nf):
+                    seg = dec[k * (slen + plen + 8):
+                              (k + 1) * (slen + plen + 8)]
+                    self.assertTrue(frame_is_valid(seg, sync, plen))
+                checked += 1
         self.assertGreater(checked, 20)
 
 

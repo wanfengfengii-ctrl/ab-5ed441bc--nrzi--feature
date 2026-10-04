@@ -197,6 +197,147 @@ class ApiTests(unittest.TestCase):
         else:
             self.fail("应返回 400")
 
+    def test_nrzi_cross_frame_continuity(self):
+        """NRZI 线电平：电平状态跨帧连续，初始电平由求解器裁决。
+
+        构造 3 帧逻辑流并做 NRZI 编码（初始电平 0），在第 2、3 帧区域各
+        制造一次物理电平插入/漏失；API 必须联合裁决初始电平，返回物理
+        校正串、逐帧逻辑载荷/CRC，且事件 bit 为物理电平。
+        """
+        rng = random.Random(77)
+        sync = "10101011"
+        frames = [make_frame(sync, "".join(rng.choice("01") for _ in range(18)))
+                  for _ in range(3)]
+        logical = "".join(frames)
+        frame_len = len(sync) + 18 + 8
+
+        def nrzi_encode(bits, init):
+            out, lev = [], init
+            for b in bits:
+                if b == "1":
+                    lev ^= 1
+                out.append(str(lev))
+            return "".join(out)
+
+        physical = nrzi_encode(logical, 0)
+        # 第 2 帧区域插入一个物理电平、第 3 帧区域漏失一个物理电平
+        damaged = (physical[:frame_len + 5] + "1"
+                   + physical[frame_len + 5:2 * frame_len + 9]
+                   + physical[2 * frame_len + 10:])
+        status, body = self._request("/api/v1/recover", {
+            "received": damaged, "frame_count": 3, "sync": sync,
+            "payload_len": 18, "max_slippage": 6,
+            "line_code": "nrzi", "initial_level": "unknown",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["recoverable"], body)
+        self.assertEqual(body["initial_level"], "0")
+        self.assertEqual(body["corrected"], physical)
+        self.assertEqual(body["slippage_count"], 2)
+        for i, f in enumerate(body["frames"]):
+            self.assertEqual(f["raw"], frames[i])
+            self.assertEqual(f["payload"], frames[i][len(sync):len(sync) + 18])
+            self.assertEqual(f["crc"], frames[i][-8:])
+        # 事件 bit 是物理电平：按事件回放物理校正串应得到接收物理串
+        s = body["corrected"]
+        for ev in sorted(body["events"],
+                         key=lambda e: e["position"], reverse=True):
+            if ev["kind"] == "deletion":
+                s = s[:ev["position"]] + s[ev["position"] + 1:]
+            else:
+                s = s[:ev["position"]] + ev["bit"] + s[ev["position"]:]
+        self.assertEqual(s, damaged)
+        # 事件跨越了帧边界 -> 验证是在整条电平流上联合解释
+        self.assertEqual(len({e["frame_index"] for e in body["events"]
+                              if e["frame_index"] is not None}), 2)
+
+    def test_nrzi_known_initial_level(self):
+        rng = random.Random(78)
+        sync = "11001100"
+        frames = [make_frame(sync, "".join(rng.choice("01") for _ in range(16)))
+                  for _ in range(3)]
+        logical = "".join(frames)
+
+        def nrzi_encode(bits, init):
+            out, lev = [], init
+            for b in bits:
+                if b == "1":
+                    lev ^= 1
+                out.append(str(lev))
+            return "".join(out)
+
+        physical = nrzi_encode(logical, 1)
+        status, body = self._request("/api/v1/recover", {
+            "received": physical, "frame_count": 3, "sync": sync,
+            "payload_len": 16, "max_slippage": 0,
+            "line_code": "nrzi", "initial_level": "1",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"])
+        self.assertEqual(body["initial_level"], "1")
+        self.assertEqual(body["corrected"], physical)
+
+    def test_nrzi_wrong_initial_level_unrecoverable(self):
+        rng = random.Random(79)
+        sync = "101011"
+        frames = [make_frame(sync, "".join(rng.choice("01") for _ in range(16)))
+                  for _ in range(3)]
+        logical = "".join(frames)
+
+        def nrzi_encode(bits, init):
+            out, lev = [], init
+            for b in bits:
+                if b == "1":
+                    lev ^= 1
+                out.append(str(lev))
+            return "".join(out)
+
+        physical = nrzi_encode(logical, 0)
+        status, body = self._request("/api/v1/recover", {
+            "received": physical, "frame_count": 3, "sync": sync,
+            "payload_len": 16, "max_slippage": 0,
+            "line_code": "nrzi", "initial_level": "1",
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(body["recoverable"])
+        self.assertNotIn("frames", body)
+        self.assertNotIn("corrected", body)
+        self.assertNotIn("initial_level", body)
+        self.assertGreaterEqual(body["minimum_slippage_lower_bound"], 1)
+
+    def test_nrzi_validation_errors(self):
+        # 缺 initial_level
+        status, body = self._request("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": "111000101",
+            "payload_len": 16, "max_slippage": 6, "line_code": "nrzi",
+        })
+        self.assertEqual(status, 422)
+        self.assertIn("initial_level", body["fields"])
+        # 非法取值
+        status, body = self._request("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": "111000101",
+            "payload_len": 16, "max_slippage": 6,
+            "line_code": "nrzi", "initial_level": "2",
+        })
+        self.assertEqual(status, 422)
+        self.assertIn("initial_level", body["fields"])
+        # line_code 非法
+        status, body = self._request("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": "111000101",
+            "payload_len": 16, "max_slippage": 6,
+            "line_code": "manchester", "initial_level": "0",
+        })
+        self.assertEqual(status, 422)
+        self.assertIn("line_code", body["fields"])
+        # 直接模式误带 initial_level
+        status, body = self._request("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": "111000101",
+            "payload_len": 16, "max_slippage": 6,
+            "initial_level": "0",
+        })
+        self.assertEqual(status, 422)
+        self.assertIn("initial_level", body["fields"])
+
     def test_unknown_route(self):
         status, _ = self._request("/nope", method="GET")
         self.assertEqual(status, 404)
